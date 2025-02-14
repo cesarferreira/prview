@@ -188,14 +188,25 @@ async fn main() -> Result<()> {
 
         pr_map.push((file_path.to_string_lossy().to_string(), pr));
 
-        let line = format!(
-            "{}\t{}\t{}\t{}\t{}",
-            file_path.to_string_lossy(),
-            relative_time,
-            status_colored,
-            title_colored,
-            repo_name
-        );
+        // Only include repository name in the display if --all flag is used
+        let line = if args.all {
+            format!(
+                "{}\t{}\t{}\t{}\t{}",
+                file_path.to_string_lossy(),
+                relative_time,
+                status_colored,
+                title_colored,
+                repo_name
+            )
+        } else {
+            format!(
+                "{}\t{}\t{}\t{}",
+                file_path.to_string_lossy(),
+                relative_time,
+                status_colored,
+                title_colored,
+            )
+        };
         fzf_lines.push(line);
     }
 
@@ -205,11 +216,18 @@ async fn main() -> Result<()> {
     let mut input_file = tempfile::NamedTempFile::new()?;
     write!(input_file, "{}", fzf_input)?;
 
-    // Run fzf
-    let fzf_cmd = format!(
-        "fzf --ansi --delimiter='\t' --with-nth=2,3,4,5 --preview 'bat --color=always --line-range :500 {{1}}' < {}",
-        input_file.path().to_string_lossy()
-    );
+    // Adjust fzf command based on whether we're showing repository names
+    let fzf_cmd = if args.all {
+        format!(
+            "fzf --ansi --delimiter='\t' --with-nth=2,3,4,5 --preview 'bat --color=always --line-range :500 {{1}}' < {}",
+            input_file.path().to_string_lossy()
+        )
+    } else {
+        format!(
+            "fzf --ansi --delimiter='\t' --with-nth=2,3,4 --preview 'bat --color=always --line-range :500 {{1}}' < {}",
+            input_file.path().to_string_lossy()
+        )
+    };
 
     let output = duct::cmd!("sh", "-c", &fzf_cmd)
         .stdin_null()
