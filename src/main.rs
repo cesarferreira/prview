@@ -61,16 +61,14 @@ fn get_relative_time(date: DateTime<Utc>) -> String {
 }
 
 fn get_status_priority(pr: &PullRequest) -> i32 {
-    if pr.merged {
-        3
-    } else if pr.state == "CLOSED" {
-        2
+    if pr.state == "OPEN" && !pr.is_draft {
+        0  // Highest priority for open PRs
     } else if pr.is_draft {
-        0
-    } else if pr.state == "OPEN" {
-        1
+        1  // Second priority for drafts
+    } else if pr.merged {
+        2  // Third priority for merged
     } else {
-        4
+        3  // Lowest priority for closed
     }
 }
 
@@ -158,7 +156,6 @@ async fn fetch_pull_requests(token: &str, owner: &str, repo: &str, author: &str)
         .json::<serde_json::Value>()
         .await?;
 
-    // Check for GraphQL errors
     if let Some(errors) = response.get("errors") {
         return Err(anyhow::anyhow!(
             "GraphQL Error: {}",
@@ -166,14 +163,9 @@ async fn fetch_pull_requests(token: &str, owner: &str, repo: &str, author: &str)
         ));
     }
 
-    // Print raw response for debugging
-    println!("Raw response: {}", serde_json::to_string_pretty(&response)?);
-
     let nodes = response["data"]["search"]["nodes"]
         .as_array()
         .context("No PRs found")?;
-
-    println!("Found {} PRs in total", nodes.len());
 
     let prs = nodes
         .iter()
@@ -197,12 +189,6 @@ async fn fetch_pull_requests(token: &str, owner: &str, repo: &str, author: &str)
         })
         .collect::<Result<Vec<_>>>()?;
 
-    if prs.is_empty() {
-        println!("No pull requests found for {}/{} by {}", owner, repo, author);
-    } else {
-        println!("Found {} pull requests", prs.len());
-    }
-
     Ok(prs)
 }
 
@@ -213,7 +199,6 @@ async fn main() -> Result<()> {
     let github_token = env::var("GITHUB_TOKEN")
         .context("Missing GITHUB_TOKEN in environment variables")?;
 
-    // Get authenticated user if no author specified
     let client = reqwest::Client::new();
     let author = if let Some(author) = args.author {
         author
@@ -227,18 +212,15 @@ async fn main() -> Result<()> {
             .json::<serde_json::Value>()
             .await?;
         
-        let login = response["login"]
+        response["login"]
             .as_str()
             .context("Could not get authenticated user")?
-            .to_string();
-        println!("Using authenticated user: {}", login);
-        login
+            .to_string()
     };
 
     let repo_info = get_current_repo_info()?
         .context("Not in a git repository or not a GitHub repository")?;
 
-    println!("Fetching PRs for repository: {}/{}", repo_info.0, repo_info.1);
     let mut all_prs = fetch_pull_requests(&github_token, &repo_info.0, &repo_info.1, &author).await?;
 
     if all_prs.is_empty() {
@@ -246,14 +228,14 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Sort items
+    // Sort items by status priority and update time
     all_prs.sort_by(|a, b| {
         let pa = get_status_priority(a);
         let pb = get_status_priority(b);
         if pa != pb {
             pa.cmp(&pb)
         } else {
-            b.updated_at.cmp(&a.updated_at)
+            b.updated_at.cmp(&a.updated_at)  // Most recent first within same status
         }
     });
 
@@ -322,12 +304,12 @@ async fn main() -> Result<()> {
     // Adjust fzf command based on whether we're showing repository names
     let fzf_cmd = if args.all {
         format!(
-            "fzf --ansi --delimiter='\t' --with-nth=2,3,4,5 --preview 'bat --color=always --line-range :500 {{1}}' < {}",
+            "fzf --ansi --delimiter='\t' --with-nth=2,3,4,5 --preview 'bat --color=always --line-range :500 {{1}} | sed '1d'' < {}",
             input_file.path().to_string_lossy()
         )
     } else {
         format!(
-            "fzf --ansi --delimiter='\t' --with-nth=2,3,4 --preview 'bat --color=always --line-range :500 {{1}}' < {}",
+            "fzf --ansi --delimiter='\t' --with-nth=2,3,4 --preview 'bat --color=always --line-range :500 {{1}}' < {} | sed '1d'",
             input_file.path().to_string_lossy()
         )
     };
