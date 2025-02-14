@@ -1,15 +1,25 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use clap::Parser;
 use colored::*;
+use git2::Repository;
 use octocrab::models::pulls::PullRequest;
 use serde::Deserialize;
 use std::{
     env,
     fs::{self, File},
     io::Write,
-    path::Path,
+    path::{Path, PathBuf},
 };
 use tempfile::TempDir;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// List PRs from all repositories (default: only current repository)
+    #[arg(long)]
+    all: bool,
+}
 
 #[derive(Debug, Deserialize)]
 struct SearchItem {
@@ -58,8 +68,46 @@ fn get_status_priority(pr: &SearchItem) -> i32 {
     }
 }
 
+fn get_current_repo_info() -> Result<Option<(String, String)>> {
+    let current_dir = env::current_dir()?;
+    let repo = match Repository::discover(&current_dir) {
+        Ok(repo) => repo,
+        Err(_) => return Ok(None),
+    };
+
+    let remote = repo
+        .find_remote("origin")
+        .context("No 'origin' remote found")?;
+    
+    let url = remote.url().context("No URL found for origin remote")?;
+    
+    // Extract owner and repo from different URL formats
+    let repo_path = if url.contains("github.com:") {
+        // SSH format: git@github.com:owner/repo.git
+        url.split("github.com:").nth(1)
+    } else if url.contains("github.com/") {
+        // HTTPS format: https://github.com/owner/repo.git
+        url.split("github.com/").nth(1)
+    } else {
+        return Err(anyhow::anyhow!("Not a GitHub repository URL: {}", url));
+    }
+    .context("Could not parse GitHub repository URL")?
+    .trim_end_matches(".git")
+    .to_string();
+
+    // Split into owner and repo
+    let parts: Vec<&str> = repo_path.split('/').collect();
+    if parts.len() >= 2 {
+        Ok(Some((parts[0].to_string(), parts[1].to_string())))
+    } else {
+        Err(anyhow::anyhow!("Invalid GitHub repository format: {}", repo_path))
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
+
     let github_token = env::var("GITHUB_TOKEN")
         .context("Missing GITHUB_TOKEN in environment variables")?;
 
@@ -72,8 +120,16 @@ async fn main() -> Result<()> {
     let user = octocrab.current().user().await?;
     println!("Authenticated as: {}\n", user.login);
 
-    // Search for PRs
-    let query = format!("author:{} is:pr", user.login);
+    // Build search query based on arguments
+    let query = if args.all {
+        format!("author:{} is:pr", user.login)
+    } else {
+        // Get current repository information
+        let repo_info = get_current_repo_info()?
+            .context("Not in a git repository or not a GitHub repository")?;
+        format!("author:{} is:pr repo:{}/{}", user.login, repo_info.0, repo_info.1)
+    };
+
     let search_results = octocrab
         .search()
         .issues_and_pull_requests(&query)
@@ -82,6 +138,11 @@ async fn main() -> Result<()> {
         .await?;
 
     let mut items: Vec<SearchItem> = serde_json::from_value(serde_json::to_value(search_results.items)?)?;
+
+    if items.is_empty() {
+        println!("No pull requests found.");
+        return Ok(());
+    }
 
     // Sort items
     items.sort_by(|a, b| {
