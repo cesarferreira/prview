@@ -3,7 +3,6 @@ use chrono::{DateTime, Utc};
 use clap::Parser;
 use colored::*;
 use git2::Repository;
-use octocrab::models::pulls::PullRequest;
 use serde::Deserialize;
 use std::{
     env,
@@ -19,19 +18,24 @@ struct Args {
     /// List PRs from all repositories (default: only current repository)
     #[arg(long)]
     all: bool,
+
+    /// Filter PRs by author (default: authenticated user)
+    #[arg(long)]
+    author: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct SearchItem {
+#[derive(Debug)]
+struct PullRequest {
     number: i32,
     title: String,
     html_url: String,
     body: Option<String>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
-    repository_url: String,
+    repository_name: String,
     state: String,
-    draft: Option<bool>,
+    is_draft: bool,
+    merged: bool,
 }
 
 fn get_relative_time(date: DateTime<Utc>) -> String {
@@ -56,15 +60,17 @@ fn get_relative_time(date: DateTime<Utc>) -> String {
     }
 }
 
-fn get_status_priority(pr: &SearchItem) -> i32 {
-    if pr.state == "closed" {
+fn get_status_priority(pr: &PullRequest) -> i32 {
+    if pr.merged {
+        3
+    } else if pr.state == "CLOSED" {
         2
-    } else if pr.draft.unwrap_or(false) {
+    } else if pr.is_draft {
         0
-    } else if pr.state == "open" {
+    } else if pr.state == "OPEN" {
         1
     } else {
-        3
+        4
     }
 }
 
@@ -104,6 +110,102 @@ fn get_current_repo_info() -> Result<Option<(String, String)>> {
     }
 }
 
+async fn fetch_pull_requests(token: &str, owner: &str, repo: &str, author: &str) -> Result<Vec<PullRequest>> {
+    let client = reqwest::Client::new();
+    
+    let query = r#"
+    query($searchQuery: String!) {
+      search(query: $searchQuery, type: ISSUE, first: 100) {
+        nodes {
+          ... on PullRequest {
+            number
+            title
+            url
+            body
+            createdAt
+            updatedAt
+            isDraft
+            state
+            merged
+            author {
+              login
+            }
+            repository {
+              nameWithOwner
+            }
+          }
+        }
+      }
+    }
+    "#;
+
+    let search_query = format!("type:pr repo:{}/{} author:{}", owner, repo, author);
+    
+    let variables = serde_json::json!({
+        "searchQuery": search_query,
+    });
+
+    let response = client
+        .post("https://api.github.com/graphql")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("User-Agent", "rust-graphql-client")
+        .json(&serde_json::json!({
+            "query": query,
+            "variables": variables,
+        }))
+        .send()
+        .await?
+        .json::<serde_json::Value>()
+        .await?;
+
+    // Check for GraphQL errors
+    if let Some(errors) = response.get("errors") {
+        return Err(anyhow::anyhow!(
+            "GraphQL Error: {}",
+            serde_json::to_string_pretty(errors)?
+        ));
+    }
+
+    // Print raw response for debugging
+    println!("Raw response: {}", serde_json::to_string_pretty(&response)?);
+
+    let nodes = response["data"]["search"]["nodes"]
+        .as_array()
+        .context("No PRs found")?;
+
+    println!("Found {} PRs in total", nodes.len());
+
+    let prs = nodes
+        .iter()
+        .map(|pr| {
+            Ok(PullRequest {
+                number: pr["number"].as_i64().context("No number")? as i32,
+                title: pr["title"].as_str().context("No title")?.to_string(),
+                html_url: pr["url"].as_str().context("No URL")?.to_string(),
+                body: pr["body"].as_str().map(|s| s.to_string()),
+                created_at: DateTime::parse_from_rfc3339(
+                    pr["createdAt"].as_str().context("No createdAt")?,
+                )?.with_timezone(&Utc),
+                updated_at: DateTime::parse_from_rfc3339(
+                    pr["updatedAt"].as_str().context("No updatedAt")?,
+                )?.with_timezone(&Utc),
+                repository_name: pr["repository"]["nameWithOwner"].as_str().context("No repository name")?.to_string(),
+                state: pr["state"].as_str().context("No state")?.to_string(),
+                is_draft: pr["isDraft"].as_bool().context("No isDraft")?,
+                merged: pr["merged"].as_bool().context("No merged status")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    if prs.is_empty() {
+        println!("No pull requests found for {}/{} by {}", owner, repo, author);
+    } else {
+        println!("Found {} pull requests", prs.len());
+    }
+
+    Ok(prs)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -111,41 +213,41 @@ async fn main() -> Result<()> {
     let github_token = env::var("GITHUB_TOKEN")
         .context("Missing GITHUB_TOKEN in environment variables")?;
 
-    let octocrab = octocrab::Octocrab::builder()
-        .personal_token(github_token)
-        .build()
-        .context("Failed to create GitHub client")?;
-
-    // Get authenticated user
-    let user = octocrab.current().user().await?;
-    println!("Authenticated as: {}\n", user.login);
-
-    // Build search query based on arguments
-    let query = if args.all {
-        format!("author:{} is:pr", user.login)
+    // Get authenticated user if no author specified
+    let client = reqwest::Client::new();
+    let author = if let Some(author) = args.author {
+        author
     } else {
-        // Get current repository information
-        let repo_info = get_current_repo_info()?
-            .context("Not in a git repository or not a GitHub repository")?;
-        format!("author:{} is:pr repo:{}/{}", user.login, repo_info.0, repo_info.1)
+        let response = client
+            .get("https://api.github.com/user")
+            .header("Authorization", format!("Bearer {}", github_token))
+            .header("User-Agent", "rust-graphql-client")
+            .send()
+            .await?
+            .json::<serde_json::Value>()
+            .await?;
+        
+        let login = response["login"]
+            .as_str()
+            .context("Could not get authenticated user")?
+            .to_string();
+        println!("Using authenticated user: {}", login);
+        login
     };
 
-    let search_results = octocrab
-        .search()
-        .issues_and_pull_requests(&query)
-        .per_page(100)
-        .send()
-        .await?;
+    let repo_info = get_current_repo_info()?
+        .context("Not in a git repository or not a GitHub repository")?;
 
-    let mut items: Vec<SearchItem> = serde_json::from_value(serde_json::to_value(search_results.items)?)?;
+    println!("Fetching PRs for repository: {}/{}", repo_info.0, repo_info.1);
+    let mut all_prs = fetch_pull_requests(&github_token, &repo_info.0, &repo_info.1, &author).await?;
 
-    if items.is_empty() {
+    if all_prs.is_empty() {
         println!("No pull requests found.");
         return Ok(());
     }
 
     // Sort items
-    items.sort_by(|a, b| {
+    all_prs.sort_by(|a, b| {
         let pa = get_status_priority(a);
         let pb = get_status_priority(b);
         if pa != pb {
@@ -161,13 +263,14 @@ async fn main() -> Result<()> {
     let mut fzf_lines = Vec::new();
     let mut pr_map = Vec::new();
 
-    for pr in &items {
-        let repo_name = pr.repository_url.replace("https://api.github.com/repos/", "");
+    for pr in &all_prs {
         let relative_time = get_relative_time(pr.updated_at);
 
-        let status_colored = if pr.state == "closed" {
+        let status_colored = if pr.merged {
+            "MERGED".purple().to_string()
+        } else if pr.state == "CLOSED" {
             "CLOSED".red().to_string()
-        } else if pr.draft.unwrap_or(false) {
+        } else if pr.is_draft {
             "DRAFT".dimmed().to_string()
         } else {
             "OPEN".green().to_string()
@@ -176,7 +279,7 @@ async fn main() -> Result<()> {
         let title_colored = pr.title.blue().to_string();
 
         // Create PR body file
-        let safe_repo_name = repo_name.replace('/', "_");
+        let safe_repo_name = pr.repository_name.replace('/', "_");
         let file_name = format!("{}_{}.md", safe_repo_name, pr.number);
         let file_path = temp_dir.path().join(&file_name);
 
@@ -196,7 +299,7 @@ async fn main() -> Result<()> {
                 relative_time,
                 status_colored,
                 title_colored,
-                repo_name
+                pr.repository_name
             )
         } else {
             format!(
