@@ -65,19 +65,20 @@ async function listMyPRs(): Promise<void> {
 
     // Build search query for PRs authored by the user.
     const query = `author:${username} is:pr`;
-
     const { data: searchResults } = await octokit.rest.search.issuesAndPullRequests({
       q: query,
       per_page: 100,
     });
     let items = searchResults.items as SearchItem[];
 
-    // Sort PRs: drafts first, then open, then closed;
-    // within each group, the most recently updated come first.
+    // Sorting:
+    // - If the PR is closed, it should always come with priority 2.
+    // - Otherwise, if it's a draft, priority 0.
+    // - Then open PRs get priority 1.
     const getStatusPriority = (pr: SearchItem): number => {
+      if (pr.state === "closed") return 2;
       if (pr.draft) return 0;
       if (pr.state === "open") return 1;
-      if (pr.state === "closed") return 2;
       return 3;
     };
 
@@ -88,52 +89,67 @@ async function listMyPRs(): Promise<void> {
       return new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime();
     });
 
-    // Create a temporary directory to hold the PR body files.
+    // Create a temporary directory to hold PR body files.
     const tempDir = mkdtempSync(join(tmpdir(), "pr-bodies-"));
 
-    // We'll build a mapping from preview file path to its PR.
+    // Map the preview file path to its PR.
     const prMap = new Map<string, SearchItem>();
+
+    // ANSI escape codes.
+    const blue = "\x1b[34m";
+    const green = "\x1b[32m";
+    const red = "\x1b[31m";
+    const grey = "\x1b[90m";
+    const reset = "\x1b[0m";
 
     // Build fzf input lines (tab-separated):
     // Field 1: preview file path (hidden)
-    // Field 2: PR title
-    // Field 3: Relative date (from updated_at)
-    // Field 4: Status (DRAFT/OPEN/CLOSED)
+    // Field 2: Relative time (plain text, on the left)
+    // Field 3: Status (colored: DRAFT in grey, OPEN in green, CLOSED in red)
+    // Field 4: PR title (colored blue)
     // Field 5: Project name (owner/repo)
     const fzfLines = items.map(pr => {
       const repoName = pr.repository_url.replace("https://api.github.com/repos/", "");
-      const statusLabel = pr.draft ? "DRAFT" : pr.state.toUpperCase();
-      const relativeDate = getRelativeTime(pr.updated_at);
+      const relativeTime = getRelativeTime(pr.updated_at);
+      
+      let statusColored: string;
+      if (pr.state === "closed") {
+        statusColored = `${red}CLOSED${reset}`;
+      } else if (pr.draft) {
+        statusColored = `${grey}DRAFT${reset}`;
+      } else {
+        statusColored = `${green}OPEN${reset}`;
+      }
+      
+      const titleColored = `${blue}${pr.title}${reset}`;
 
       // Create a file for the PR body (markdown).
-      // Replace slashes in repoName to avoid directory issues.
       const safeRepoName = repoName.replace(/\//g, "_");
       const fileName = `${safeRepoName}_${pr.number}.md`;
       const filePath = join(tempDir, fileName);
       writeFileSync(filePath, pr.body || "", "utf-8");
 
-      // Map the file path to the PR object.
       prMap.set(filePath, pr);
 
-      // Build a tab-separated line.
-      return `${filePath}\t${pr.title}\t${relativeDate}\t${statusLabel}\t${repoName}`;
+      // Visible fields order: Relative time, Status, Title, Project name.
+      return `${filePath}\t${relativeTime}\t${statusColored}\t${titleColored}\t${repoName}`;
     });
     const fzfInput = fzfLines.join("\n");
 
     // fzf command:
-    // --delimiter sets tab as the field separator.
-    // --with-nth=2,3,4,5 tells fzf to display only the title, relative date, status, and project name.
-    // The preview uses field {1} (the preview file path) and pipes it to bat for markdown syntax highlighting.
-    const fzfCmd = `fzf --delimiter="\t" --with-nth=2,3,4,5 --preview 'bat --style=numbers --color=always --line-range :500 {1}'`;
+    // --ansi to enable ANSI color codes.
+    // --delimiter sets tab as separator.
+    // --with-nth=2,3,4,5 displays Relative time, Status, Title, and Project name.
+    // The preview uses field {1} (the preview file path) and pipes it to bat.
+    const fzfCmd = `fzf --ansi --delimiter="\t" --with-nth=2,3,4,5 --preview 'bat --style=numbers --color=always --line-range :500 {1}'`;
 
-    // Run fzf.
     const fzfResult = spawnSync(fzfCmd, {
       input: fzfInput,
       encoding: "utf-8",
       shell: true,
     });
 
-    // Clean up the temporary directory (remove all PR body files).
+    // Clean up the temporary directory.
     rmSync(tempDir, { recursive: true, force: true });
 
     const selectedLine = fzfResult.stdout.trim();
@@ -142,7 +158,6 @@ async function listMyPRs(): Promise<void> {
       return;
     }
 
-    // fzf returns the full line; extract the preview file path (field 1).
     const selectedFields = selectedLine.split("\t");
     const previewFilePath = selectedFields[0];
     const selectedPR = prMap.get(previewFilePath);
