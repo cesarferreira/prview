@@ -22,6 +22,10 @@ struct Args {
     /// Filter PRs by author (default: authenticated user)
     #[arg(long)]
     author: Option<String>,
+
+    /// Disable preview panel
+    #[arg(long)]
+    no_preview: bool,
 }
 
 #[derive(Debug)]
@@ -300,15 +304,23 @@ async fn main() -> Result<()> {
     let mut input_file = tempfile::NamedTempFile::new()?;
     write!(input_file, "{}", fzf_input)?;
 
-    // Adjust fzf command based on whether we're showing repository names
+    // Adjust fzf command based on whether we're showing repository names and preview
+    let preview_cmd = if args.no_preview {
+        ""
+    } else {
+        "--preview 'bat --color=always --line-range :500 {1} | sed \"1d\"'"
+    };
+
     let fzf_cmd = if args.all {
         format!(
-            "fzf --ansi --delimiter='\t' --with-nth=2,3,4,5 --preview 'bat --color=always --line-range :500 {{1}} | sed '1d'' < {}",
+            "fzf --ansi --delimiter='\t' --with-nth=2,3,4,5 {} < {}",
+            preview_cmd,
             input_file.path().to_string_lossy()
         )
     } else {
         format!(
-            "fzf --ansi --delimiter='\t' --with-nth=2,3,4 --preview 'bat --color=always --line-range :500 {{1}}' < {} | sed '1d'",
+            "fzf --ansi --delimiter='\t' --with-nth=2,3,4 {} < {}",
+            preview_cmd,
             input_file.path().to_string_lossy()
         )
     };
