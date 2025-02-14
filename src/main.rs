@@ -61,14 +61,12 @@ fn get_relative_time(date: DateTime<Utc>) -> String {
 }
 
 fn get_status_priority(pr: &PullRequest) -> i32 {
-    if pr.state == "OPEN" && !pr.is_draft {
-        0  // Highest priority for open PRs
-    } else if pr.is_draft {
-        1  // Second priority for drafts
+    if pr.is_draft || (pr.state == "OPEN" && !pr.is_draft) {
+        0  // Highest priority for draft and open PRs
     } else if pr.merged {
-        2  // Third priority for merged
+        1  // Lower priority for merged
     } else {
-        3  // Lowest priority for closed
+        2  // Lowest priority for closed
     }
 }
 
@@ -228,14 +226,15 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Sort items by status priority and update time
+    // Sort items by update time first, then by status priority
     all_prs.sort_by(|a, b| {
-        let pa = get_status_priority(a);
-        let pb = get_status_priority(b);
-        if pa != pb {
+        let date_cmp = b.updated_at.cmp(&a.updated_at);  // Most recent first
+        if date_cmp == std::cmp::Ordering::Equal {
+            let pa = get_status_priority(a);
+            let pb = get_status_priority(b);
             pa.cmp(&pb)
         } else {
-            b.updated_at.cmp(&a.updated_at)  // Most recent first within same status
+            date_cmp
         }
     });
 
