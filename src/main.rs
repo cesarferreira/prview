@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use colored::*;
-use dotenv::dotenv;
 use octocrab::models::pulls::PullRequest;
 use serde::Deserialize;
 use std::{
@@ -61,8 +60,6 @@ fn get_status_priority(pr: &SearchItem) -> i32 {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    dotenv().ok();
-
     let github_token = env::var("GITHUB_TOKEN")
         .context("Missing GITHUB_TOKEN in environment variables")?;
 
@@ -149,7 +146,7 @@ async fn main() -> Result<()> {
 
     // Run fzf
     let fzf_cmd = format!(
-        "fzf --ansi --delimiter='\t' --with-nth=2,3,4,5 --preview 'bat --style=numbers --color=always --line-range :500 {{1}}' < {}",
+        "fzf --ansi --delimiter='\t' --with-nth=2,3,4,5 --preview 'bat --color=always --line-range :500 {{1}}' < {}",
         input_file.path().to_string_lossy()
     );
 
