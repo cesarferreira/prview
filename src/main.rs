@@ -194,6 +194,59 @@ async fn fetch_pull_requests(token: &str, owner: &str, repo: &str, author: &str)
     Ok(prs)
 }
 
+async fn handle_pr_action(pr: &PullRequest) -> Result<()> {
+    let actions = if pr.state == "OPEN" {
+        vec![
+            ("Open in browser", format!("gh pr view --web {}", pr.number)),
+            ("Checkout PR", format!("gh pr checkout {}", pr.number)),
+            ("Merge PR", format!("gh pr merge {}", pr.number)),
+        ]
+    } else if pr.is_draft {
+        vec![
+            ("Open in browser", format!("gh pr view --web {}", pr.number)),
+            ("Checkout PR", format!("gh pr checkout {}", pr.number)),
+            ("Mark as ready for review", format!("gh pr ready {}", pr.number)),
+        ]
+    } else {
+        vec![
+            ("Open in browser", format!("gh pr view --web {}", pr.number)),
+            ("Checkout PR", format!("gh pr checkout {}", pr.number)),
+        ]
+    };
+
+    // Create temporary file for fzf input
+    let mut input_file = tempfile::NamedTempFile::new()?;
+    let input_content = actions
+        .iter()
+        .map(|(desc, _)| desc.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    write!(input_file, "{}", input_content)?;
+
+    // Run fzf for action selection
+    let fzf_cmd = format!(
+        "fzf --ansi --no-preview < {}",
+        input_file.path().to_string_lossy()
+    );
+
+    let output = duct::cmd!("sh", "-c", &fzf_cmd)
+        .stdin_null()
+        .stdout_capture()
+        .unchecked()
+        .run()?;
+
+    if !output.stdout.is_empty() {
+        let selected = String::from_utf8(output.stdout)?.trim().to_string();
+        if let Some((_, cmd)) = actions.iter().find(|(desc, _)| desc == &selected) {
+            println!("Executing: {}", cmd);
+            duct::cmd!("sh", "-c", cmd)
+                .run()?;
+        }
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -337,9 +390,8 @@ async fn main() -> Result<()> {
         let preview_file_path = selected_fields[0];
 
         if let Some((_, pr)) = pr_map.iter().find(|(path, _)| path == preview_file_path) {
-            println!("\nSelected PR:");
-            println!("Title: {}", pr.title);
-            println!("URL  : {}", pr.html_url);
+            println!("\nSelected PR: {} ({})", pr.title, pr.html_url);
+            handle_pr_action(pr).await?;
         }
     } else {
         println!("No PR selected.");
